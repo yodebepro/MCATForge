@@ -111,6 +111,21 @@ app.use((req, res, next) => {
   res.set("X-Frame-Options", "SAMEORIGIN");
   next();
 });
+// Let the trainer page on GitHub Pages (or another address) use this server.
+// ALLOWED_ORIGINS: comma-separated list, e.g. https://yodebepro.github.io  (default: any site; sign-in uses a token, not cookies)
+const ORIGINS = (process.env.ALLOWED_ORIGINS || "*").split(",").map((x) => x.trim().replace(/\/+$/, "")).filter(Boolean);
+app.use("/api", (req, res, next) => {
+  const o = req.get("Origin");
+  if (o && (ORIGINS.includes("*") || ORIGINS.includes(o))) {
+    res.set("Access-Control-Allow-Origin", o);
+    res.set("Vary", "Origin");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS");
+    res.set("Access-Control-Max-Age", "86400");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 app.use("/api", express.json({ limit: "25mb", strict: false }));
 app.use("/api", (req, res, next) => { res.set("Cache-Control", "no-store"); next(); });
 
@@ -197,16 +212,21 @@ for (const kind of ["blocks", "figs", "texts"]) {
 
 app.use("/api", (req, res) => fail(res, 404, "not_found", "Not found."));
 
-// the app itself
-const pub = path.join(__dirname, "public");
-app.use(express.static(pub, {
-  extensions: ["html"],
-  setHeaders(res, file) {
-    if (file.endsWith(".html")) res.set("Cache-Control", "no-cache");
-    else res.set("Cache-Control", "public, max-age=86400");
-    if (file.endsWith(".wasm")) res.set("Content-Type", "application/wasm");
-  },
-}));
+// the app itself. On this server the page always uses its own sign-in.
+app.get("/config.js", (req, res) => { res.type("application/javascript").set("Cache-Control", "no-cache").send('window.MBT_API = "api";\n'); });
+// only the trainer's own files are served, never server.js, package.json or data/
+const PUBLIC = /^\/(?:index\.html|offline\.html|mespeak-voice\.js|choice-library\.json|robots\.txt|tess\/[\w.-]+)?$/;
+app.use((req, res, next) => (req.method === "GET" || req.method === "HEAD") && PUBLIC.test(req.path)
+  ? express.static(__dirname, {
+      index: "index.html", dotfiles: "deny",
+      setHeaders(res, file) {
+        if (file.endsWith(".html")) res.set("Cache-Control", "no-cache");
+        else res.set("Cache-Control", "public, max-age=86400");
+        if (file.endsWith(".wasm")) res.set("Content-Type", "application/wasm");
+      },
+    })(req, res, next)
+  : next());
+app.use((req, res) => res.status(404).type("text/plain").send("Not found"));
 
 app.use((err, req, res, next) => {
   if (err.type === "entity.too.large") return fail(res, 413, "too_large", "That item is too big to save.");

@@ -11,3 +11,5 @@ services:
         sync: false
       - key: SIGNUP_CODE
         sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
