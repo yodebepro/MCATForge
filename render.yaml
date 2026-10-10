@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mcat-block-trainer
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SIGNUP_CODE
+        sync: false
