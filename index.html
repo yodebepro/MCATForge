@@ -693,7 +693,7 @@ async function speakBackup(parts, my, done){
     if (!ctx){ toast("This screen can't play sound. Try opening the trainer in Chrome or Safari."); return done(false); }
     for (const p of parts){
       if (my !== speechGen) return done(false);
-      const arr = ms.speak(p, {rawdata:"array", speed:Math.round(145 * S.settings.rate), pitch:50, wordgap:2, amplitude:110});
+      const arr = ms.speak(p, bvOpts());
       if (!arr || !arr.length) continue;
       const ab = new Uint8Array(arr).buffer;
       const buf = await new Promise((ok,bad)=>{ const r = ctx.decodeAudioData(ab, ok, bad); if (r && r.catch) r.catch(bad); });
@@ -773,7 +773,7 @@ function addToBank({section, source, passages, questions, file, pack}){
 }
 
 /* ---------- views ---------- */
-function setView(v){ if (ui.view === "reader" && v !== "reader"){ rdTok++; if (rd) rd.playing = false; } ui.view = v; cancelAuto(); stopSpeech(); render(); window.scrollTo(0,0); }
+function setView(v){ if (ui.view === "reader" && v !== "reader"){ rdTok++; if (rd) rd.playing = false; try { keepAlive.stop(); } catch(e){} } ui.view = v; cancelAuto(); stopSpeech(); render(); window.scrollTo(0,0); }
 function render(){
   const m = $("#main"); m.replaceChildren();
   m.className = "wrap" + (ui.view === "quiz" ? " wide" : "");
@@ -872,6 +872,7 @@ function renderHome(m){
   const foot = el("div",{class:"foot"});
   foot.append(el("div",{id:"footNote"}));
   foot.append(deviceCard());
+  foot.append(backupCard());
   const setBtn = el("button",{class:"btn ghost small",type:"button","aria-expanded":String(ui.settingsOpen),on:{click:()=>{ui.settingsOpen=!ui.settingsOpen; render();}}}, ui.settingsOpen ? "Hide settings" : "Study settings");
   foot.append(el("div",null,setBtn));
   if (ui.settingsOpen){
@@ -968,6 +969,143 @@ function deviceCard(){
   box.append(el("b",null,"Use it on another device"),
     el("p",{class:"note"},`Download one file with the whole trainer and all ${total} of your questions inside. Open it in Chrome or Safari on any phone or computer, no Claude account needed. It reads aloud with that device's own natural voice. It can't read new files with Claude or write new questions; download a fresh copy whenever you add more.`),
     el("div",null,btn), msg);
+  return box;
+}
+/* ---------- backup & restore, and saved document links ---------- */
+function links(){ return S.links || (S.links = []); }
+async function saveFile(name, blob){
+  const dl = (window.claude?.use && !OFFLINE && !SERVER) ? await claude.use("downloads").catch(()=>null) : null;
+  if (dl){ await dl.save({filename:name, data:blob}); return; }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+}
+async function makeBackup(btn, msg){
+  btn.disabled = true; msg.textContent = "Gathering everything…";
+  try {
+    const texts = {};
+    for (const r of fileRecs()){ try { const t = await Store.getText(r.id); if (t) texts[r.id] = t; } catch(e){} }
+    const state = JSON.parse(JSON.stringify(S));
+    const qs = Object.values(blocks).reduce((a,b)=>a+b.questions.length, 0);
+    const data = {
+      app: "MCAT Block Trainer", kind: "backup", v: 1, createdAt: new Date().toISOString(),
+      summary: {questions: qs, blocks: Object.keys(blocks).length, files: fileRecs().length, links: links().length},
+      links: links(),                       // your saved document links, first so they're easy to find in the file
+      files: fileRecs().map(r => ({name: r.name, addedAt: r.addedAt ? new Date(r.addedAt).toISOString() : null, questions: r.count || 0})),
+      state, blocks: JSON.parse(JSON.stringify(blocks)), figs, texts
+    };
+    const d = new Date(), stamp = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+    await saveFile(`MCAT-Trainer-backup-${stamp}.json`, new Blob([JSON.stringify(data)], {type:"application/json"}));
+    msg.textContent = `Backup saved: ${qs} questions, ${fileRecs().length} files and ${links().length} links. Keep it on Google Drive, OneDrive or anywhere you like.`;
+  } catch(e){
+    msg.textContent = e?.code === "declined" ? "Backup canceled." : "Couldn't save the backup. Try again.";
+  }
+  btn.disabled = false;
+}
+async function restoreBackup(data, mode){
+  if (!data || data.kind !== "backup" || !data.blocks || !data.state) throw new Error("not a backup");
+  if (mode === "replace"){
+    for (const id of Object.keys(blocks)) if (!data.blocks[id]) Store.delBlock(id);
+    for (const id of Object.keys(figs)) if (!(data.figs||{})[id]) Store.delFig(id);
+    blocks = data.blocks; figs = data.figs || {};
+    const keepLook = {theme: S.settings.theme, scale: S.settings.scale};
+    S = {...S, ...data.state, settings: {...S.settings, ...(data.state.settings||{}), ...keepLook}};
+    for (const r of fileRecs()) if (r.status === "reading") r.status = "new";
+  } else {
+    for (const [id, b] of Object.entries(data.blocks)) if (!blocks[id]) blocks[id] = b;
+    for (const [id, f] of Object.entries(data.figs||{})) if (!figs[id]) figs[id] = f;
+    const st = data.state;
+    for (const [id, p] of Object.entries(st.progress||{})) if (!S.progress[id]) S.progress[id] = p;
+    const have = new Set(fileRecs().map(r=>r.id)); for (const r of st.files||[]) if (!have.has(r.id)) fileRecs().push(r);
+    S.readPos = {...(st.readPos||{}), ...(S.readPos||{})};
+  }
+  const haveL = new Set(links().map(l=>l.url)); for (const l of data.links||data.state.links||[]) if (l?.url && !haveL.has(l.url)){ links().push(l); haveL.add(l.url); }
+  for (const b of Object.values(blocks)) saveBlock(b);
+  for (const [id, f] of Object.entries(figs)) Store.putFig(id, f);
+  for (const [id, t] of Object.entries(data.texts||{})) Store.putText(id, t);
+  await saveStateNow();
+  return Object.values(data.blocks).reduce((a,b)=>a+b.questions.length, 0);
+}
+// turn a share link into a direct download where the service allows it
+function directLink(u){
+  try {
+    const url = new URL(u.trim()); const h = url.hostname;
+    let m;
+    if (/drive\.google\.com$/.test(h)){ const id = (url.pathname.match(/\/d\/([\w-]+)/)||[])[1] || url.searchParams.get("id"); if (id) return `https://drive.google.com/uc?export=download&id=${id}`; }
+    if (/docs\.google\.com$/.test(h) && (m = url.pathname.match(/\/document\/d\/([\w-]+)/))) return `https://docs.google.com/document/d/${m[1]}/export?format=docx`;
+    if (/dropbox\.com$/.test(h)){ url.hostname = "dl.dropboxusercontent.com"; url.searchParams.delete("dl"); return url.href; }
+    if (/onedrive\.live\.com$|1drv\.ms$|sharepoint\.com$/.test(h)){ url.searchParams.set("download", "1"); return url.href; }
+    return url.href;
+  } catch(e){ return null; }
+}
+function linkService(u){ try { const h = new URL(u).hostname; return /google/.test(h) ? "Google Drive" : /onedrive|1drv|sharepoint/.test(h) ? "OneDrive" : /dropbox/.test(h) ? "Dropbox" : /icloud/.test(h) ? "iCloud" : h.replace(/^www\./,""); } catch(e){ return "Link"; } }
+async function importFromLink(l, btn){
+  const src = directLink(l.url); if (!src){ toast("That doesn't look like a web link."); return; }
+  btn && (btn.disabled = true); toast("Getting the file from the link…");
+  try {
+    const r = await fetch(src, {redirect:"follow"});
+    if (!r.ok) throw 0;
+    const type = (r.headers.get("content-type")||"").split(";")[0];
+    if (/text\/html/.test(type)) throw 0;   // a sign-in or preview page, not the file
+    const blob = await r.blob();
+    const ext = /pdf/.test(type) ? ".pdf" : /word|officedocument/.test(type) ? ".docx" : /text\/plain/.test(type) ? ".txt" : /image\//.test(type) ? "." + type.split("/")[1] : "";
+    let name = l.title || decodeURIComponent((new URL(l.url).pathname.split("/").pop()||"Linked file"));
+    if (ext && !name.toLowerCase().endsWith(ext)) name += ext;
+    resetImport(); await addFiles([new File([blob], name, {type})]); setView("import");
+  } catch(e){
+    toast(`${linkService(l.url)} didn't let the trainer download this file directly. Tap Open, download the file, then add it with Choose files. The link stays saved here.`);
+  }
+  btn && (btn.disabled = false);
+}
+function backupCard(){
+  const box = el("div",{class:"settings",id:"backupCard"});
+  const msg = el("p",{class:"note",role:"status"},"");
+  const bBtn = el("button",{class:"btn primary small",type:"button",on:{click:()=>makeBackup(bBtn, msg)}}, el("span",{html:ICON.download}), "Back up everything");
+  const rIn = el("input",{type:"file",id:"restoreIn",class:"file-hit",accept:".json,application/json","aria-label":"Restore from a backup",on:{change:async e=>{
+    const f = e.target.files?.[0]; e.target.value = ""; if (!f) return;
+    try { const d = JSON.parse(await f.text()); if (d?.kind !== "backup" || !d.blocks) throw 0; ui.pendingRestore = d; ui.pendingRestoreName = f.name; render(); setTimeout(()=>document.getElementById("backupCard")?.scrollIntoView({block:"center"}), 50); }
+    catch(err){ toast("That file isn't a trainer backup. Choose the MCAT-Trainer-backup .json file."); } }}});
+  box.append(el("b",null,"Backup & restore"),
+    el("p",{class:"note"},"Save one file with all your questions, blocks, progress, generated packs, reading text and saved links. Keep it on Google Drive, OneDrive, Dropbox or anywhere. On another computer or phone, open the trainer and tap Restore to bring everything back."),
+    el("div",null, bBtn),
+    el("div",{class:"photo-btn",style:"justify-items:start;text-align:left;margin-top:8px"}, el("b",null,"Restore from a backup"), el("span",{class:"muted"},"Choose your MCAT-Trainer-backup .json file, from your phone, Google Drive, OneDrive or anywhere"), rIn), msg);
+  const pr = ui.pendingRestore;
+  if (pr){
+    const sm = pr.summary || {};
+    box.append(el("div",{class:"confirm",style:"background:var(--warn-bg);display:grid;gap:8px"},
+      el("span",null, `“${ui.pendingRestoreName}”, made ${pr.createdAt ? new Date(pr.createdAt).toLocaleString() : ""}: ${sm.questions ?? "?"} questions, ${sm.files ?? 0} files, ${sm.links ?? 0} links.`),
+      el("div",{class:"row",style:"flex-wrap:wrap;gap:8px"},
+        el("button",{class:"btn small primary",type:"button",on:{click:async()=>{ const d = ui.pendingRestore; ui.pendingRestore = null; try { const n = await restoreBackup(d, "add"); render(); toast(`Restored. Questions you didn't have were added (backup holds ${n}).`); } catch(e){ toast("Couldn't restore that backup."); render(); } }}},"Add to what's here"),
+        el("button",{class:"btn small danger",type:"button",on:{click:async()=>{ const d = ui.pendingRestore; ui.pendingRestore = null; try { const n = await restoreBackup(d, "replace"); render(); toast(`Restored ${n} questions, your progress and your links.`); } catch(e){ toast("Couldn't restore that backup."); render(); } }}},"Replace everything here"),
+        el("button",{class:"btn small ghost",type:"button",on:{click:()=>{ ui.pendingRestore = null; render(); }}},"Cancel"))));
+  }
+  // saved links
+  const L = links();
+  const list = el("ul",{class:"blist",style:"margin-top:4px"});
+  for (const l of L){
+    const imp1 = el("button",{class:"btn ghost small",type:"button",title:"Try to bring this file into the trainer",on:{click:e=>importFromLink(l, e.currentTarget)}},"Add to my documents");
+    list.append(el("li",{class:"brow",style:"grid-template-columns:minmax(0,1fr) auto"},
+      el("div",{style:"min-width:0"}, el("div",{class:"t",style:"overflow-wrap:anywhere"}, l.title || l.url), el("div",{class:"m",style:"overflow-wrap:anywhere;word-break:break-all"}, linkService(l.url) + (l.title ? " · " + l.url : ""))),
+      el("div",{class:"bact",style:"flex-wrap:wrap;justify-content:flex-end"},
+        el("a",{class:"btn small",href:l.url,target:"_blank",rel:"noopener noreferrer",style:"text-decoration:none;color:inherit"},"Open ↗"), imp1,
+        el("button",{class:"btn ghost small",type:"button","aria-label":"Remove link "+(l.title||l.url),on:{click:()=>{ S.links = links().filter(x=>x!==l); saveState(); render(); }}},"✕"))));
+  }
+  const tIn = el("input",{type:"text",id:"linkTitle",placeholder:"Name (optional), e.g. UWorld Bio PDF"});
+  const uIn = el("input",{type:"text",autocapitalize:"none",spellcheck:"false",id:"linkUrl",placeholder:"Paste a Google Drive, OneDrive, Dropbox, PDF or Word link",inputmode:"url"});
+  const add = () => {
+    let u = uIn.value.trim(); if (!u) return;
+    if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+    try { new URL(u); } catch(e){ toast("That doesn't look like a link."); return; }
+    if (links().some(x=>x.url === u)){ toast("That link is already saved."); return; }
+    links().push({id:uid("l"), title:tIn.value.trim(), url:u, addedAt:Date.now()}); saveState(); render();
+    setTimeout(()=>document.getElementById("linkUrl")?.focus(), 30);
+  };
+  uIn.addEventListener("keydown", e=>{ if (e.key === "Enter"){ e.preventDefault(); add(); } });
+  box.append(el("b",{style:"margin-top:10px;display:block"}, `My document links (${L.length})`),
+    el("p",{class:"note"},"Keep the links to your files here, from any service. They're saved with the trainer and included in every backup, so they come back on any device."),
+    L.length ? list : el("p",{class:"muted",style:"margin:4px 0"},"No links saved yet."),
+    el("label",{class:"field",for:"linkUrl"}, el("span",null,"Add a link"), uIn),
+    el("label",{class:"field",for:"linkTitle"}, el("span",null,"Name"), tIn),
+    el("div",null, el("button",{class:"btn small primary",type:"button",on:{click:add}},"Save link")));
   return box;
 }
 function renderFootNote(){
@@ -1408,8 +1546,12 @@ function renderReader(m){
     ? "Your file's text exactly as it came in. Scroll anywhere and tap a sentence to start reading right there."
     : "Each question the trainer made from this file, with its choices, answer and explanation. Use this to check that nothing came in wrong. Tap any line to read from there."));
   m.append(el("label",{class:"note",style:"display:flex;gap:8px;align-items:flex-start;margin:0 0 10px;cursor:pointer"},
-    el("input",{type:"checkbox",id:"bgListen",checked:bgOn(),style:"margin-top:3px",on:{change:e=>{ const was = rd.playing; S.settings.bgListen = e.target.checked; saveState(); if (was) readFrom(rd.pos); }}}),
-    el("span",null, el("b",null,"Keep reading with the screen off. "), "Uses the built-in voice so it keeps playing when your phone is locked or you switch apps. You can pause or skip from the lock screen. Turn it off to use your phone's own voice, which stops when the screen goes off.")));
+    el("input",{type:"checkbox",id:"bgListen",checked:bgOn(),style:"margin-top:3px",on:{change:e=>{ const was = rd.playing; S.settings.bgListen = e.target.checked; saveState(); render(); if (was) readFrom(rd.pos); }}}),
+    el("span",null, el("b",null,"Keep reading when the screen is off. "), "While the screen is on you hear your phone's natural voice. When you lock the phone or switch apps, the phone mutes that voice, so the built-in voice carries on from the same sentence. When you come back, the natural voice takes over again. You can pause or skip from the lock screen.")));
+  if (bgOn()) m.append(el("div",{class:"note",style:"display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px"},
+    el("span",null,"Screen-off voice:"),
+    ...BV_STYLES.map(([v,l])=>el("button",{class:"chip",type:"button","aria-pressed":String((S.settings.bvStyle ?? "m3")===v),on:{click:()=>{ S.settings.bvStyle = v; saveState(); chunkCache.clear(); render(); previewVoice(); }}}, l)),
+    el("button",{class:"btn ghost small",type:"button",on:{click:previewVoice}},"▶ Hear it")));
   rd.paras = buildParas(); rd.units = [];
   const box = el("div",{class:"reader",id:"readerBody"});
   if (!rd.paras.length) box.append(el("p",{class:"muted"}, rd.tab==="doc" ? "There's no saved text for this file on this device." : "No questions came from this file."));
@@ -1460,57 +1602,130 @@ function renderReader(m){
   updateReaderCtl();
   if (rd.pos >= 0) setTimeout(()=>markNow(true), 30);
 }
-/* ---------- screen-off listening: the reader plays real audio, so it keeps going when the phone is locked ---------- */
-let bgAudio = null, bgGen = 0, bgDone = null;
-const bgCache = new Map();
+/* ---------- screen-off listening ----------
+   Screen on: your chosen voice (the phone's natural voice by default).
+   Screen off: Android Chrome stops the phone's voice, so the reader switches to the built-in voice played as real audio
+   (long stretches, tied to the lock-screen player) and switches back to the natural voice when the screen comes on.
+   A quiet keep-alive track holds the media player open the whole time, which is what lets Chrome keep playing. */
+let bgAudio = null, bgDone = null;
+const clipCache = new Map(), chunkCache = new Map();
 function bgOn(){ return S.settings.bgListen !== false; }
 function bgEl(){ if (!bgAudio){ bgAudio = new Audio(); bgAudio.preload = "auto"; bgAudio.setAttribute("playsinline", ""); } return bgAudio; }
-function joinWavs(list){
-  const parts = list.map(b => { const v = new DataView(b.buffer, b.byteOffset, b.byteLength); let o = 12;
-    while (o + 8 <= b.length){ const id = String.fromCharCode(b[o],b[o+1],b[o+2],b[o+3]); const sz = v.getUint32(o+4, true);
-      if (id === "data") return {hdr: b.subarray(0, o+8), data: b.subarray(o+8, Math.min(b.length, o+8+sz))};
-      o += 8 + sz + (sz & 1); }
-    return null; }).filter(Boolean);
-  if (!parts.length) return null;
-  const total = parts.reduce((a,d)=>a+d.data.length, 0);
-  const hdr = new Uint8Array(parts[0].hdr); const hv = new DataView(hdr.buffer);
-  hv.setUint32(4, hdr.length - 8 + total, true); hv.setUint32(hdr.length - 4, total, true);
-  return new Blob([hdr, ...parts.map(d=>d.data)], {type:"audio/wav"});
+// built-in voice settings: a softer style and a gentle filter that takes the buzz off
+const BV_STYLES = [["","Standard"],["m3","Deeper"],["klatt3","Soft"],["f2","Female"]];
+function bvOpts(){ const v = S.settings.bvStyle ?? "m3"; return Object.assign({rawdata:"array", speed:Math.round(140 * S.settings.rate), pitch:45, wordgap:1, amplitude:100}, v ? {variant:v} : {}); }
+function wavParts(b){
+  const v = new DataView(b.buffer, b.byteOffset, b.byteLength); let o = 12, rate = 22050, fmt = null;
+  while (o + 8 <= b.length){
+    const id = String.fromCharCode(b[o],b[o+1],b[o+2],b[o+3]); const sz = v.getUint32(o+4, true);
+    if (id === "fmt ") rate = v.getUint32(o+12, true);
+    if (id === "data") return {hdr: b.subarray(0, o+8), data: b.subarray(o+8, Math.min(b.length, o+8+sz)), rate};
+    o += 8 + sz + (sz & 1);
+  }
+  return null;
 }
-function clipFor(text){
-  const key = S.settings.rate + "|" + text;
-  if (bgCache.has(key)) return bgCache.get(key);
+function smooth(pcm){
+  // one-pole low-pass (~3.5 kHz at 22 kHz) to soften the harsh edge of the synthetic voice
+  if (S.settings.bvSmooth === false) return pcm;
+  const out = new Int16Array(pcm.length); let y = 0;
+  for (let i = 0; i < pcm.length; i++){ y += 0.62 * (pcm[i] - y); out[i] = y; }
+  return out;
+}
+function wavFrom(pcmList, rate){
+  const total = pcmList.reduce((a,p)=>a+p.length, 0);
+  const buf = new ArrayBuffer(44 + total*2), v = new DataView(buf);
+  const w = (o,s)=>{ for (let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+  w(0,"RIFF"); v.setUint32(4, 36 + total*2, true); w(8,"WAVE"); w(12,"fmt "); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate*2, true); v.setUint16(32,2,true); v.setUint16(34,16,true); w(36,"data"); v.setUint32(40, total*2, true);
+  let o = 44; for (const p of pcmList){ new Int16Array(buf, o, p.length).set(p); o += p.length*2; }
+  return new Blob([buf], {type:"audio/wav"});
+}
+async function clipPcm(text){
+  const key = JSON.stringify(bvOpts()) + (S.settings.bvSmooth === false ? "r" : "s") + "|" + text;
+  if (clipCache.has(key)) return clipCache.get(key);
+  const ms = await loadBackupVoice();
+  const pcm = []; let rate = 22050;
+  for (const p of speechParts(text)){
+    const arr = ms.speak(p, bvOpts()); if (!arr || !arr.length) continue;
+    const w = wavParts(new Uint8Array(arr)); if (!w) continue;
+    rate = w.rate; const d = w.data; pcm.push(smooth(new Int16Array(d.buffer.slice(d.byteOffset, d.byteOffset + (d.byteLength & ~1)))));
+  }
+  const r = {pcm, rate};
+  clipCache.set(key, r); while (clipCache.size > 120) clipCache.delete(clipCache.keys().next().value);
+  return r;
+}
+// a stretch of sentences joined into one audio file, with the start time of each sentence
+function buildChunk(k, small){
+  const key = k + "|" + (small ? 1 : 0) + "|" + JSON.stringify(bvOpts()) + rd.id + rd.tab;
+  if (chunkCache.has(key)) return chunkCache.get(key);
   const pr = (async () => {
-    const ms = await loadBackupVoice();
-    const chunks = [];
-    for (const p of speechParts(text)){ const arr = ms.speak(p, {rawdata:"array", speed:Math.round(145 * S.settings.rate), pitch:50, wordgap:2, amplitude:110}); if (arr && arr.length) chunks.push(new Uint8Array(arr)); }
-    const blob = chunks.length ? joinWavs(chunks) : null;
-    return blob ? URL.createObjectURL(blob) : null;
+    const parts = [], marks = []; let rate = 22050, secs = 0, u = k;
+    const maxU = small ? 3 : 30, maxS = small ? 10 : 75;
+    while (u < rd.units.length && u - k < maxU && secs < maxS){
+      const c = await clipPcm(rd.units[u].say); rate = c.rate;
+      marks.push({u, t: secs});
+      for (const p of c.pcm){ parts.push(p); secs += p.length / rate; }
+      const gap = new Int16Array(Math.round(rate * 0.3)); parts.push(gap); secs += gap.length / rate;
+      u++;
+      await new Promise(r=>setTimeout(r, 0));   // keep the page responsive while the voice is made
+    }
+    if (!marks.length) return null;
+    if (secs < 6){ const pad = new Int16Array(Math.round(rate * (6 - secs))); parts.push(pad); }   // Chrome only keeps media of 5 s or more going
+    return {url: URL.createObjectURL(wavFrom(parts, rate)), marks, end: u};
   })();
-  bgCache.set(key, pr); pr.catch(()=>bgCache.delete(key));
-  while (bgCache.size > 8){ const [k0, p0] = bgCache.entries().next().value; bgCache.delete(k0); p0.then(u=>{ if (u) setTimeout(()=>URL.revokeObjectURL(u), 60000); }).catch(()=>{}); }
+  chunkCache.set(key, pr); pr.catch(()=>chunkCache.delete(key));
+  while (chunkCache.size > 6){ const [k0, p0] = chunkCache.entries().next().value; chunkCache.delete(k0); p0.then(c=>{ if (c) setTimeout(()=>URL.revokeObjectURL(c.url), 120000); }).catch(()=>{}); }
   return pr;
 }
-function speakBg(text, next){
-  return new Promise(async res => {
-    const my = ++bgGen;
-    let url = null;
-    try { url = await clipFor(text); } catch(e){ toast("The built-in voice couldn't load. Turn off \u201cKeep reading with the screen off\u201d to use your phone's voice."); return res(false); }
-    if (my !== bgGen) return res(false);
-    if (!url) return res(true);
-    const a = bgEl();
-    let settled = false;
-    const done = v => { if (settled) return; settled = true; a.onended = a.onerror = null; bgDone = null; res(!!v && my === bgGen); };
+function playChunk(ch, my, onHalf){
+  return new Promise(res => {
+    const a = bgEl(); let settled = false, half = false;
+    const done = v => { if (settled) return; settled = true; a.onended = a.onerror = a.ontimeupdate = null; bgDone = null; res(!!v && my === rdTok); };
     bgDone = done;
+    a.ontimeupdate = () => {
+      if (my !== rdTok) return;
+      let m = ch.marks[0]; for (const x of ch.marks) if (x.t <= a.currentTime + 0.05) m = x;
+      if (m && m.u !== rd.pos){ rd.pos = m.u; rd.unitStart = Date.now() - (a.currentTime - m.t) * 1000; markNow(); rememberPos(); updateReaderCtl(); }
+      if (!half && a.duration && a.currentTime > a.duration * 0.35){ half = true; onHalf(); }
+    };
     a.onended = () => done(true);
     a.onerror = () => done(false);
-    a.src = url;
-    try { await a.play(); } catch(e){ return done(false); }
-    // get the next sentence ready while this one plays, so there's no gap with the screen off
-    if (next) setTimeout(()=>{ clipFor(next).catch(()=>{}); }, 50);
+    a.src = ch.url;
+    a.play().catch(() => done(false));
   });
 }
-function stopBg(){ bgGen++; if (bgAudio){ try { bgAudio.pause(); } catch(e){} } if (bgDone) bgDone(false); }
+function stopBg(){ if (bgAudio){ try { bgAudio.pause(); } catch(e){} } if (bgDone) bgDone(false); }
+// keep-alive: a near-silent looping track so the phone treats the reader as a media player while it reads
+const keepAlive = {
+  el: null,
+  start(){
+    try {
+      if (!this.el){
+        const rate = 8000, n = rate * 10, pcm = new Int16Array(n);
+        for (let i = 0; i < n; i++) pcm[i] = (i % 2 ? 1 : -1);   // far below hearing, but real sound to the phone
+        this.el = new Audio(URL.createObjectURL(wavFrom([pcm], rate))); this.el.loop = true; this.el.volume = 0.05; this.el.setAttribute("playsinline","");
+      }
+      if (this.el.paused) this.el.play().catch(()=>{});
+    } catch(e){}
+  },
+  stop(){ try { this.el?.pause(); } catch(e){} }
+};
+// reads from unit k with the built-in voice as audio; returns where to carry on, or -1 if it stopped
+async function playBgFrom(k, my){
+  rd.inBg = true; mediaSessionFor();
+  let next = null, cur = buildChunk(k, true);
+  while (true){
+    let ch;
+    try { ch = await cur; } catch(e){ toast("The built-in voice couldn't load, so reading stopped."); return -1; }
+    if (my !== rdTok) return -1;
+    if (!ch) return rd.units.length;
+    const ok = await playChunk(ch, my, () => { if (!next && ch.end < rd.units.length) next = buildChunk(ch.end, false); });
+    if (my !== rdTok || !ok) return -1;
+    if (ch.end >= rd.units.length) return rd.units.length;
+    if (!document.hidden && !usingBackup()) return ch.end;   // screen is back on: the natural voice takes over
+    cur = next || buildChunk(ch.end, false); next = null;
+  }
+}
 function mediaSessionFor(){
   if (!rd || !("mediaSession" in navigator)) return;
   try {
@@ -1519,6 +1734,11 @@ function mediaSessionFor(){
       seekbackward: ()=>skipBy(-1), seekforward: ()=>skipBy(1), previoustrack: ()=>skipBy(-1), nexttrack: ()=>skipBy(1)};
     for (const [k, f] of Object.entries(h)){ try { navigator.mediaSession.setActionHandler(k, f); } catch(e){} }
   } catch(e){}
+}
+function previewVoice(){
+  stopSpeech();
+  const text = "This is how I will read your document when the screen is off.";
+  clipPcm(text).then(c => { const a = bgEl(); a.src = URL.createObjectURL(wavFrom(c.pcm, c.rate)); a.play().catch(()=>{}); }).catch(()=>toast("The built-in voice couldn't load."));
 }
 function switchReaderTab(tab){
   pauseReader(); rd.tab = tab;
@@ -1593,31 +1813,51 @@ async function readFrom(i){
   if (!rd || !rd.units?.length) return;
   stopSpeech();
   const my = ++rdTok;
-  rd.playing = true; rd.interrupted = false;
-  if (bgOn()) mediaSessionFor();
+  rd.playing = true; rd.interrupted = false; rd.inBg = false;
+  if (bgOn()){ keepAlive.start(); mediaSessionFor(); }
   if (rd.restored){ rd.restored = false; document.querySelector("#main .resume")?.remove(); }
   rd.userScrollAt = 0;
   updateReaderCtl();
-  for (let k = Math.max(0, i); k < rd.units.length; k++){
+  let k = Math.max(0, i);
+  while (k < rd.units.length){
     if (my !== rdTok || ui.view !== "reader") return;
+    if (bgOn() && (document.hidden || usingBackup())){
+      const r = await playBgFrom(k, my);
+      if (my !== rdTok) return;
+      rd.inBg = false;
+      if (r < 0){ rd.playing = false; keepAlive.stop(); updateReaderCtl(); return; }
+      k = r; continue;
+    }
     rd.pos = k; rd.unitStart = Date.now(); markNow(); rememberPos(); updateReaderCtl();
-    const ok = bgOn() ? await speakBg(rd.units[k].say, rd.units[k+1]?.say) : await speak(rd.units[k].say, true);
+    if (bgOn()) buildChunk(k, true).catch(()=>{});   // have the built-in voice ready in case the screen goes off
+    const ok = await speak(rd.units[k].say, true);
     if (my !== rdTok) return;
-    if (!ok){ rd.playing = false; rd.interrupted = document.hidden && !bgOn(); updateReaderCtl(); return; }
+    if (!ok){
+      if (bgOn() && document.hidden) continue;    // the screen went off mid-sentence: same sentence, built-in voice
+      rd.playing = false; rd.interrupted = document.hidden; keepAlive.stop(); updateReaderCtl(); return;
+    }
+    k++;
   }
   // finished the whole thing: next time it starts from the top
-  rd.playing = false; rd.pos = -1; markNow();
+  rd.playing = false; rd.pos = -1; markNow(); keepAlive.stop();
   if (S.readPos) { delete S.readPos[rd.id]; saveState(); }
   updateReaderCtl();
 }
-function pauseReader(){ rdTok++; stopSpeech(); if (rd){ rd.playing = false; rd.interrupted = false; rememberPos(); updateReaderCtl(); } }
+function pauseReader(){ rdTok++; stopSpeech(); keepAlive.stop(); if (rd){ rd.playing = false; rd.interrupted = false; rememberPos(); updateReaderCtl(); } }
 // when you scroll yourself, the reader stops jumping the page for a few seconds
 ["wheel","touchmove"].forEach(ev => window.addEventListener(ev, ()=>{ if (rd && ui.view === "reader") rd.userScrollAt = Date.now(); }, {passive:true}));
 window.addEventListener("keydown", e=>{ if (rd && ui.view === "reader" && /^(PageUp|PageDown|ArrowUp|ArrowDown|Home|End)$/.test(e.key)) rd.userScrollAt = Date.now(); });
 // phone locked or app switched: keep the spot; when you come back, carry on from the same sentence
 document.addEventListener("visibilitychange", ()=>{
   if (!rd || ui.view !== "reader") return;
-  if (document.hidden){ rememberPos(); return; }
+  if (document.hidden){
+    rememberPos();
+    // screen off while the natural voice is reading: carry on right away with the built-in voice
+    if (rd.playing && !rd.inBg && bgOn()) readFrom(rd.pos);
+    return;
+  }
+  // screen back on while the built-in voice is reading: go back to the natural voice
+  if (rd.playing && rd.inBg && !usingBackup()){ readFrom(rd.pos); return; }
   let talking = false;
   try { talking = (tts.native && speechSynthesis.speaking) || (!!curSrc && audioCtx()?.state === "running") || (!!bgAudio && !bgAudio.paused && !bgAudio.ended); } catch(e){}
   if ((rd.playing && !talking) || rd.interrupted) setTimeout(()=>{ if (rd && ui.view === "reader" && !document.hidden) readFrom(rd.pos); }, 400);
