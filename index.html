@@ -647,7 +647,9 @@ document.addEventListener("pointerdown", ()=>audioCtx(), {capture:true});
 function loadBackupVoice(){
   if (!backupLoad){
     toast("Getting the reading voice ready…");
-    backupLoad = scriptOnce("mespeak-voice.js").then(()=>window.meSpeak || Promise.reject(new Error("voice missing"))).catch(e=>{ backupLoad = null; throw e; });
+    const inl = document.getElementById("mbt-voice");
+    const src = inl && inl.textContent.length > 1000 ? URL.createObjectURL(new Blob([inl.textContent], {type:"text/javascript"})) : "mespeak-voice.js";
+    backupLoad = scriptOnce(src).then(()=>window.meSpeak || Promise.reject(new Error("voice missing"))).catch(e=>{ backupLoad = null; throw e; });
   }
   return backupLoad;
 }
@@ -705,7 +707,7 @@ async function speakBackup(parts, my, done){
     done(false);
   }
 }
-function stopSpeech(){ speechGen++; try { tts.native && speechSynthesis.cancel(); } catch(e){} try { curSrc?.stop(); } catch(e){} curSrc = null; }
+function stopSpeech(){ stopBg(); speechGen++; try { tts.native && speechSynthesis.cancel(); } catch(e){} try { curSrc?.stop(); } catch(e){} curSrc = null; }
 
 /* ---------- bank helpers ---------- */
 function allBlocks(){ const list = Object.values(blocks); return list; }
@@ -1405,6 +1407,9 @@ function renderReader(m){
   m.append(el("p",{class:"note",style:"margin:0 0 10px"}, rd.tab==="doc"
     ? "Your file's text exactly as it came in. Scroll anywhere and tap a sentence to start reading right there."
     : "Each question the trainer made from this file, with its choices, answer and explanation. Use this to check that nothing came in wrong. Tap any line to read from there."));
+  m.append(el("label",{class:"note",style:"display:flex;gap:8px;align-items:flex-start;margin:0 0 10px;cursor:pointer"},
+    el("input",{type:"checkbox",id:"bgListen",checked:bgOn(),style:"margin-top:3px",on:{change:e=>{ const was = rd.playing; S.settings.bgListen = e.target.checked; saveState(); if (was) readFrom(rd.pos); }}}),
+    el("span",null, el("b",null,"Keep reading with the screen off. "), "Uses the built-in voice so it keeps playing when your phone is locked or you switch apps. You can pause or skip from the lock screen. Turn it off to use your phone's own voice, which stops when the screen goes off.")));
   rd.paras = buildParas(); rd.units = [];
   const box = el("div",{class:"reader",id:"readerBody"});
   if (!rd.paras.length) box.append(el("p",{class:"muted"}, rd.tab==="doc" ? "There's no saved text for this file on this device." : "No questions came from this file."));
@@ -1455,6 +1460,66 @@ function renderReader(m){
   updateReaderCtl();
   if (rd.pos >= 0) setTimeout(()=>markNow(true), 30);
 }
+/* ---------- screen-off listening: the reader plays real audio, so it keeps going when the phone is locked ---------- */
+let bgAudio = null, bgGen = 0, bgDone = null;
+const bgCache = new Map();
+function bgOn(){ return S.settings.bgListen !== false; }
+function bgEl(){ if (!bgAudio){ bgAudio = new Audio(); bgAudio.preload = "auto"; bgAudio.setAttribute("playsinline", ""); } return bgAudio; }
+function joinWavs(list){
+  const parts = list.map(b => { const v = new DataView(b.buffer, b.byteOffset, b.byteLength); let o = 12;
+    while (o + 8 <= b.length){ const id = String.fromCharCode(b[o],b[o+1],b[o+2],b[o+3]); const sz = v.getUint32(o+4, true);
+      if (id === "data") return {hdr: b.subarray(0, o+8), data: b.subarray(o+8, Math.min(b.length, o+8+sz))};
+      o += 8 + sz + (sz & 1); }
+    return null; }).filter(Boolean);
+  if (!parts.length) return null;
+  const total = parts.reduce((a,d)=>a+d.data.length, 0);
+  const hdr = new Uint8Array(parts[0].hdr); const hv = new DataView(hdr.buffer);
+  hv.setUint32(4, hdr.length - 8 + total, true); hv.setUint32(hdr.length - 4, total, true);
+  return new Blob([hdr, ...parts.map(d=>d.data)], {type:"audio/wav"});
+}
+function clipFor(text){
+  const key = S.settings.rate + "|" + text;
+  if (bgCache.has(key)) return bgCache.get(key);
+  const pr = (async () => {
+    const ms = await loadBackupVoice();
+    const chunks = [];
+    for (const p of speechParts(text)){ const arr = ms.speak(p, {rawdata:"array", speed:Math.round(145 * S.settings.rate), pitch:50, wordgap:2, amplitude:110}); if (arr && arr.length) chunks.push(new Uint8Array(arr)); }
+    const blob = chunks.length ? joinWavs(chunks) : null;
+    return blob ? URL.createObjectURL(blob) : null;
+  })();
+  bgCache.set(key, pr); pr.catch(()=>bgCache.delete(key));
+  while (bgCache.size > 8){ const [k0, p0] = bgCache.entries().next().value; bgCache.delete(k0); p0.then(u=>{ if (u) setTimeout(()=>URL.revokeObjectURL(u), 60000); }).catch(()=>{}); }
+  return pr;
+}
+function speakBg(text, next){
+  return new Promise(async res => {
+    const my = ++bgGen;
+    let url = null;
+    try { url = await clipFor(text); } catch(e){ toast("The built-in voice couldn't load. Turn off \u201cKeep reading with the screen off\u201d to use your phone's voice."); return res(false); }
+    if (my !== bgGen) return res(false);
+    if (!url) return res(true);
+    const a = bgEl();
+    let settled = false;
+    const done = v => { if (settled) return; settled = true; a.onended = a.onerror = null; bgDone = null; res(!!v && my === bgGen); };
+    bgDone = done;
+    a.onended = () => done(true);
+    a.onerror = () => done(false);
+    a.src = url;
+    try { await a.play(); } catch(e){ return done(false); }
+    // get the next sentence ready while this one plays, so there's no gap with the screen off
+    if (next) setTimeout(()=>{ clipFor(next).catch(()=>{}); }, 50);
+  });
+}
+function stopBg(){ bgGen++; if (bgAudio){ try { bgAudio.pause(); } catch(e){} } if (bgDone) bgDone(false); }
+function mediaSessionFor(){
+  if (!rd || !("mediaSession" in navigator)) return;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({title: rd.name, artist: "MCAT Block Trainer", album: rd.tab === "doc" ? "Reading your document" : "Questions as imported"});
+    const h = {play: ()=>{ if (rd && !rd.playing) readFrom(Math.max(0, rd.pos)); }, pause: ()=>pauseReader(), stop: ()=>pauseReader(),
+      seekbackward: ()=>skipBy(-1), seekforward: ()=>skipBy(1), previoustrack: ()=>skipBy(-1), nexttrack: ()=>skipBy(1)};
+    for (const [k, f] of Object.entries(h)){ try { navigator.mediaSession.setActionHandler(k, f); } catch(e){} }
+  } catch(e){}
+}
 function switchReaderTab(tab){
   pauseReader(); rd.tab = tab;
   const saved = readPosOf(rd.id);
@@ -1478,6 +1543,7 @@ function sentences(t){
 }
 function setRate(d){ S.settings.rate = Math.max(0.6, Math.min(1.8, +(S.settings.rate + d).toFixed(1))); saveState(); const r = $("#rRate"); if (r) r.textContent = S.settings.rate.toFixed(1) + "×"; if (rd?.playing) readFrom(rd.pos); }
 function updateReaderCtl(){
+  if (rd && "mediaSession" in navigator){ try { navigator.mediaSession.playbackState = rd.playing ? "playing" : "paused"; } catch(e){} }
   const b = $("#rPlay"); if (!b || !rd) return;
   b.replaceChildren(el("span",{html: rd.playing ? '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>' : ICON.play}), rd.playing ? "Pause" : (rd.pos > 0 ? "Resume" : "Read aloud"));
   const n = rd.units?.length || 0, p = Math.max(0, rd.pos);
@@ -1528,15 +1594,16 @@ async function readFrom(i){
   stopSpeech();
   const my = ++rdTok;
   rd.playing = true; rd.interrupted = false;
+  if (bgOn()) mediaSessionFor();
   if (rd.restored){ rd.restored = false; document.querySelector("#main .resume")?.remove(); }
   rd.userScrollAt = 0;
   updateReaderCtl();
   for (let k = Math.max(0, i); k < rd.units.length; k++){
     if (my !== rdTok || ui.view !== "reader") return;
     rd.pos = k; rd.unitStart = Date.now(); markNow(); rememberPos(); updateReaderCtl();
-    const ok = await speak(rd.units[k].say, true);
+    const ok = bgOn() ? await speakBg(rd.units[k].say, rd.units[k+1]?.say) : await speak(rd.units[k].say, true);
     if (my !== rdTok) return;
-    if (!ok){ rd.playing = false; rd.interrupted = document.hidden; updateReaderCtl(); return; }
+    if (!ok){ rd.playing = false; rd.interrupted = document.hidden && !bgOn(); updateReaderCtl(); return; }
   }
   // finished the whole thing: next time it starts from the top
   rd.playing = false; rd.pos = -1; markNow();
@@ -1552,7 +1619,7 @@ document.addEventListener("visibilitychange", ()=>{
   if (!rd || ui.view !== "reader") return;
   if (document.hidden){ rememberPos(); return; }
   let talking = false;
-  try { talking = (tts.native && speechSynthesis.speaking) || (!!curSrc && audioCtx()?.state === "running"); } catch(e){}
+  try { talking = (tts.native && speechSynthesis.speaking) || (!!curSrc && audioCtx()?.state === "running") || (!!bgAudio && !bgAudio.paused && !bgAudio.ended); } catch(e){}
   if ((rd.playing && !talking) || rd.interrupted) setTimeout(()=>{ if (rd && ui.view === "reader" && !document.hidden) readFrom(rd.pos); }, 400);
   else { markNow(true); updateReaderCtl(); }
 });
@@ -1572,14 +1639,28 @@ function fileRecs(){ return S.files || (S.files = []); }
 function recHere(r){ return (r.blobIds||[]).every(id => memBlobs[id] || cachedIds.has(id)); }
 async function getBlob(id){ return memBlobs[id] || await IDB.get("files", id); }
 function isPhoto(f){ return /^image\//.test(f.type || "") || /\.(jpe?g|png|heic|heif|webp|gif)$/i.test(f.name || ""); }
+/* ----- same file twice: a fingerprint of the file's bytes (any name) and of its words ----- */
+function fnv(bytes){ let h = 0x811c9dc5; for (let i = 0; i < bytes.length; i++){ h ^= bytes[i]; h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(36); }
+async function fileHash(f){ try { const b = new Uint8Array(await f.arrayBuffer()); return b.length + ":" + fnv(b) + ":" + fnv(b.subarray(0, 65536).reverse()); } catch(e){ return null; } }
+function textHash(t){ const n = String(t||"").replace(/\[\[(?:PIC|FIG):[^\]]+\]\]/g,"").toLowerCase().replace(/[^a-z0-9]+/g,""); return n.length < 200 ? null : n.length + ":" + fnv(new TextEncoder().encode(n)); }
+// a question's identity: its full wording plus its correct answer (same question in another file = same key)
+function dupKey(q){ const n = t => String(t||"").replace(/\[\[(?:PIC|FIG):[^\]]+\]\]/g,"").toLowerCase().replace(/[^a-z0-9]+/g,""); const st = n(q.stem); return st.length < 12 ? "" : st + "|" + n(q.choices?.[q.answer]); }
+function dupWarn(msg){ if (imp){ (imp.warn = imp.warn || []).push(msg); } toast(msg); }
+function whenAdded(r){ return r?.addedAt ? " (added " + new Date(r.addedAt).toLocaleDateString() + ")" : ""; }
 async function addFiles(list){
   list = Array.from(list || []);   // copy first: the picker's list empties as soon as it is reset
+  // fingerprints for files added before this check existed
+  for (const r of fileRecs()) if (!r.hash && r.kind !== "photos" && recHere(r)){ const b = await getBlob(r.blobIds[0]); if (b) r.hash = await fileHash(b); }
   for (const f of list){
+    const hash = await fileHash(f);
+    const same = hash && (fileRecs().find(r => r.hash === hash) || list.slice(0, list.indexOf(f)).find(g => g._hash === hash));
+    if (same){ dupWarn(`“${f.name || "This file"}” is already in your trainer${same.name && same.name !== f.name ? ` as “${same.name}”` : ""}${whenAdded(same)}. It wasn't added again.`); continue; }
+    f._hash = hash;
     const id = uid("f");
     memBlobs[id] = f;
     const kept = (SERVER && !Srv.keep) ? false : await IDB.put("files", id, f);
     if (kept) cachedIds.add(id);
-    fileRecs().push({id, name:f.name || "File", size:f.size||0, kind:isPhoto(f) ? "photo" : "file", blobIds:[id], status:"new", count:0, note:"", addedAt:Date.now()});
+    fileRecs().push({id, name:f.name || "File", size:f.size||0, kind:isPhoto(f) ? "photo" : "file", blobIds:[id], status:"new", count:0, note:"", addedAt:Date.now(), hash});
   }
   if (imp) imp.done = null;
   saveStateNow(); render();
@@ -2383,6 +2464,9 @@ function renderImport(m){
   const panel = el("div",{class:"panel"});
   const canClaude = !!sample && !OFFLINE;
   if (!canClaude) imp.method = "local";
+  if (imp.warn?.length) panel.append(el("div",{class:"banner warn",role:"alert",id:"dupWarn"},
+    el("b",null, imp.warn.length > 1 ? "Already in your trainer" : "Already in your trainer: "), imp.warn.length > 1 ? el("ul",{style:"margin:6px 0 0;padding-left:18px"}, ...imp.warn.map(w=>el("li",null,w))) : imp.warn[0],
+    el("div",{style:"margin-top:8px"}, el("button",{class:"btn small ghost",type:"button",on:{click:()=>{ imp.warn = []; render(); }}},"OK"))));
   panel.append(el("div",{class:"banner "+(canClaude?"ok":"warn")}, canClaude
     ? "Claude is connected: it reads any layout, photos and pictures, and fills in answers your file doesn't mark."
     : OFFLINE ? "Offline copy: files are organized with the built-in reader (no Claude). Screenshots and photos need the Claude version."
@@ -2503,6 +2587,13 @@ async function runImport(){
         if (did) logImp(`  text recognition read ${doc.text.replace(/\s/g,"").length.toLocaleString()} characters from the ${doc.kind === "photos" ? "photos" : doc.kind === "pdf" ? "page images" : "pictures"}`);
       } catch(e){ logImp(`  text recognition: ${e.message || "couldn't run"}`); }
       const fileId = head.id;
+      // the same document saved another way (PDF vs Word, renamed copy…)
+      if (!src.photos){
+        const th = textHash(doc.raw || doc.text);
+        const twin = th && fileRecs().find(r => r.textHash === th && r.id !== head.id && r.status === "done");
+        if (twin){ throw {dup:true, twin}; }
+        head.textHash = th;
+      }
       let found = [], passages = {};
       const ctx = {name:src.name, forced, signal:imp.ctl.signal, passages, failed:[], fileId, doc};
       const rawText = doc.raw || doc.text || "";
@@ -2540,6 +2631,23 @@ async function runImport(){
           assignSections(found.filter(f=>!f.sec), passages, fileSec); for (const f of found) if (!f.sec) f.sec = fileSec || guessSection(f.q.stem + " " + (f.pkey && passages[f.pkey] ? passages[f.pkey].text.slice(0,1500) : ""), !!f.pkey);
         }
       }
+      // questions that are already in the trainer (from any file) aren't added twice
+      if (found.length){
+        const have = new Map();
+        for (const b of Object.values(blocks)) for (const q of b.questions) if (q.fileId !== fileId){ const k = dupKey(q); if (k && !have.has(k)) have.set(k, q.fileId); }
+        const isDup = f => { const k = dupKey(f.q); return !!k && have.has(k); };
+        const dups = found.filter(isDup);
+        if (dups.length && dups.length >= Math.ceil(found.length * 0.8)){
+          const from = {}; for (const f of dups){ const id = have.get(dupKey(f.q)); from[id] = (from[id]||0) + 1; }
+          const topId = Object.entries(from).sort((a,b)=>b[1]-a[1])[0][0];
+          throw {dup:true, twin: fileRecs().find(r=>r.id===topId) || null, same: dups.length, total: found.length};
+        }
+        if (dups.length){
+          found = found.filter(f=>!isDup(f));
+          logImp(`  ${dups.length} question${dups.length>1?"s were":" was"} already in your trainer, so ${dups.length>1?"they were":"it was"} skipped`);
+          dupWarn(`“${src.name}”: ${dups.length} of its questions were already in your trainer and weren't added again. The ${found.length} new one${found.length===1?"":"s"} were added.`);
+        }
+      }
       const nFig = await attachFigures(found, passages, doc, fileId);
       Store.putText(fileId, readerTextOf(doc));
       if (nFig) logImp(`  kept ${nFig} figure${nFig>1?"s":""} (structures, graphs, tables) with their passages and questions`);
@@ -2572,6 +2680,19 @@ async function runImport(){
       if (fails) logImp(`  ${fails} part${fails>1?"s":""} couldn't be read (${[...new Set(ctx.failed)].map(c=>FAIL_WORDS[c]||c).join(", ")})`);
       logImp(`${src.name}: ${n} question${n===1?"":"s"} added`);
     } catch(e){
+      if (e?.dup){
+        // already in the trainer: warn, and drop this copy so it isn't read again and again
+        const what = e.total ? `${e.same === e.total ? "All" : e.same + " of " + e.total} of its questions are` : "The same document is";
+        dupWarn(`“${src.name}” is already in your trainer${e.twin ? ` as “${e.twin.name}”${whenAdded(e.twin)}` : ""}. ${what} already there, so nothing was added and this copy was removed.`);
+        logImp(`${src.name}: already in your trainer${e.twin ? ` (“${e.twin.name}”)` : ""}; not added`);
+        for (const r of src.recs){
+          S.files = fileRecs().filter(x=>x.id!==r.id);
+          for (const b of r.blobIds||[]){ delete memBlobs[b]; cachedIds.delete(b); IDB.del("files", b); }
+          Store.delText(r.id); delete imp.progress[r.id];
+        }
+        saveStateNow();
+        continue;
+      }
       const msg = e?.message || "Couldn't read this file.";
       for (const r of src.recs){ r.status = "error"; r.note = msg; }
       logImp(`${src.name}: ${msg}`);
